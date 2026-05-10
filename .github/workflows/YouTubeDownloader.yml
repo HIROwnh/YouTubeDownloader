@@ -25,6 +25,11 @@ on:
         required: false
         type: number
         default: 90
+      correlation_id:
+        description: 'Unique correlation ID (output folder name)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   download-and-process:
@@ -285,8 +290,18 @@ jobs:
           FILENAME=$(sed -n '2p' /tmp/metadata.txt)
           OUTPUT_TYPE=$(sed -n '4p' /tmp/metadata.txt)
           QUALITY=$(sed -n '5p' /tmp/metadata.txt)
+          CORRELATION_ID="${{ github.event.inputs.correlation_id }}"
           
-          mkdir -p ./downloads/temp
+          # Use correlation_id as folder name if provided
+          if [ -n "$CORRELATION_ID" ]; then
+            mkdir -p "./downloads/$CORRELATION_ID/temp"
+            TEMP_DIR="./downloads/$CORRELATION_ID/temp"
+            OUTPUT_DIR="./downloads/$CORRELATION_ID"
+          else
+            mkdir -p ./downloads/temp
+            TEMP_DIR="./downloads/temp"
+            OUTPUT_DIR="./downloads"
+          fi
           
           echo "⬇️ Downloading $OUTPUT_TYPE @ $QUALITY..."
           echo "📄 File: $FILENAME"
@@ -295,18 +310,18 @@ jobs:
             -L \
             -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0" \
             -H "Referer: https://media.ytmp3.gg/" \
-            -o "./downloads/temp/$FILENAME" \
+            -o "$TEMP_DIR/$FILENAME" \
             --max-time 300 \
             --retry 3 \
             --retry-delay 5 \
             "$DOWNLOAD_URL"
           
-          if [ ! -f "./downloads/temp/$FILENAME" ]; then
+          if [ ! -f "$TEMP_DIR/$FILENAME" ]; then
             echo "❌ Download failed!"
             exit 1
           fi
           
-          FILE_SIZE=$(stat -c%s "./downloads/temp/$FILENAME")
+          FILE_SIZE=$(stat -c%s "$TEMP_DIR/$FILENAME")
           FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
           
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -319,9 +334,20 @@ jobs:
         run: |
           THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
           THRESHOLD_BYTES=$((THRESHOLD_MB * 1024 * 1024))
+          CORRELATION_ID="${{ github.event.inputs.correlation_id }}"
+          
+          # Determine paths based on correlation_id
+          if [ -n "$CORRELATION_ID" ]; then
+            TEMP_DIR="./downloads/$CORRELATION_ID/temp"
+            OUTPUT_DIR="./downloads/$CORRELATION_ID"
+          else
+            TEMP_DIR="./downloads/temp"
+            OUTPUT_DIR="./downloads"
+          fi
           
           process_file() {
             local file="$1"
+            local output_dir="$2"
             local size=$(stat -c%s "$file")
             local basename=$(basename "$file")
             local size_mb=$((size / 1024 / 1024))
@@ -331,11 +357,11 @@ jobs:
               echo "✂️ Splitting $basename (${size_mb}MB)"
               echo "   Parts size: ${THRESHOLD_MB}MB each"
               
-              cd ./downloads
+              cd "$output_dir"
               zip -r -s "${THRESHOLD_MB}m" "${basename}.zip" "temp/${basename}"
-              cd ..
+              cd - > /dev/null
               
-              PARTS_COUNT=$(ls ./downloads/${basename}.z* 2>/dev/null | wc -l)
+              PARTS_COUNT=$(ls ${output_dir}/${basename}.z* 2>/dev/null | wc -l)
               echo "✅ Created $PARTS_COUNT parts"
               
               # Remove original file from temp
@@ -346,30 +372,38 @@ jobs:
               else
                 echo "📁 $basename (${size_mb}MB) — under threshold"
               fi
-              mv "$file" "./downloads/"
+              mv "$file" "$output_dir/"
             fi
           }
           
           export -f process_file
           export THRESHOLD_BYTES THRESHOLD_MB
           
-          find ./downloads/temp -type f -exec bash -c 'process_file "$0"' {} \;
-          rm -rf ./downloads/temp
+          find "$TEMP_DIR" -type f -exec bash -c 'process_file "$0" "'"$OUTPUT_DIR"'"' {} \;
+          rm -rf "$TEMP_DIR"
           
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📂 Final files in ./downloads/:"
-          ls -lh ./downloads/ 2>/dev/null | tail -n +2 | awk '{print "  • " $NF " (" $5 ")"}'
+          echo "📂 Final files in $OUTPUT_DIR/:"
+          ls -lh "$OUTPUT_DIR/" 2>/dev/null | tail -n +2 | awk '{print "  • " $NF " (" $5 ")"}'
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       - name: 📤 Commit and Push to Repository
         run: |
           BRANCH="${GITHUB_REF_NAME}"
+          CORRELATION_ID="${{ github.event.inputs.correlation_id }}"
+          
+          # Determine what to commit
+          if [ -n "$CORRELATION_ID" ]; then
+            COMMIT_PATH="./downloads/$CORRELATION_ID/"
+          else
+            COMMIT_PATH="./downloads/"
+          fi
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
           # Stage all downloaded files
-          git add ./downloads/
+          git add "$COMMIT_PATH"
           
           if git diff --staged --quiet; then
             echo "ℹ️ No changes to commit"
@@ -383,7 +417,7 @@ jobs:
           echo "📦 Found $TOTAL_FILES file(s) to upload"
           
           # Unstage everything first for batch processing
-          git reset HEAD ./downloads/
+          git reset HEAD "$COMMIT_PATH"
           
           BATCH_SIZE=5
           for (( i=0; i<TOTAL_FILES; i+=BATCH_SIZE )); do
